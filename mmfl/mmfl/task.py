@@ -1,56 +1,79 @@
-"""mmfl: A Flower / PyTorch app."""
-
-from collections import OrderedDict
-
-import torch
+import pandas as pd
 from torch.utils.data import DataLoader, Dataset
 from torchvision.transforms import Compose, Normalize, ToTensor
 from torch_geometric.io import read_off
+import torch
 import os
+import numpy as np
+import trimesh
+import pyrender
+from typing import OrderedDict
 
-
-# class Net(nn.Module):
-#     """Model (simple CNN adapted from 'PyTorch: A 60 Minute Blitz')"""
-
-#     def __init__(self):
-#         super(Net, self).__init__()
-#         self.conv1 = nn.Conv2d(3, 6, 5)
-#         self.pool = nn.MaxPool2d(2, 2)
-#         self.conv2 = nn.Conv2d(6, 16, 5)
-#         self.fc1 = nn.Linear(16 * 5 * 5, 120)
-#         self.fc2 = nn.Linear(120, 84)
-#         self.fc3 = nn.Linear(84, 10)
-
-#     def forward(self, x):
-#         x = self.pool(F.relu(self.conv1(x)))
-#         x = self.pool(F.relu(self.conv2(x)))
-#         x = x.view(-1, 16 * 5 * 5)
-#         x = F.relu(self.fc1(x))
-#         x = F.relu(self.fc2(x))
-#         return self.fc3(x)
-
+# Read the metadata file and create a global dictionary of classes
+metadata_file = '..\\metadata_modelnet40.csv'
+metadata = pd.read_csv(metadata_file)
+class_names = metadata['class'].unique()
+class_to_idx = {class_name: idx for idx, class_name in enumerate(class_names)}
 
 class CustomDataset(Dataset):
-    def __init__(self, data_dir, transform=None):
+    def __init__(self, data_dir, transform=None, image_size=(224, 224)):
         self.data_dir = data_dir
         self.transform = transform
+        self.image_size = image_size
         self.data = []
         for file_name in os.listdir(data_dir):
             self.data.append((os.path.join(data_dir, file_name), file_name.split("_")[0]))
+        if len(self.data) == 0:
+            raise ValueError(f"No .off files found in directory: {data_dir}")
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
         file_path, class_name = self.data[idx]
-        # data = read_off(file_path)
+        print(f"Loading file: {file_path}")  # Debug print
         data = read_off(file_path)
-        modality1, modality2 = data.pos, data.face
+        modality1, modality2 = self.generate_views(data)
+        label = class_to_idx[class_name]
         # if self.transform:
         #     modality1 = self.transform(modality1)
         #     modality2 = self.transform(modality2)
-        return modality1, modality2, class_name
-    
+        return modality1, modality2, label
+
+    def generate_views(self, data):
+        # Load the 3D shape using trimesh
+        mesh = trimesh.Trimesh(vertices=data.pos.numpy(), faces=data.face.numpy().T)
+
+        # Generate two different views
+        view1 = self.render_view(mesh, angle=0)
+        view2 = self.render_view(mesh, angle=90)
+        return view1, view2
+
+    def render_view(self, mesh, angle):
+        # Create a scene and add the mesh
+        scene = pyrender.Scene()
+        mesh_node = pyrender.Mesh.from_trimesh(mesh)
+        scene.add(mesh_node)
+
+        # Set up the camera
+        camera = pyrender.PerspectiveCamera(yfov=np.pi / 3.0)
+        camera_pose = np.eye(4)
+        camera_pose[:3, :3] = trimesh.transformations.rotation_matrix(
+            np.radians(angle), [0, 1, 0]
+        )[:3, :3]
+        scene.add(camera, pose=camera_pose)
+
+        # Render the scene
+        renderer = pyrender.OffscreenRenderer(*self.image_size)
+        color, _ = renderer.render(scene)
+        renderer.delete()
+
+        # Ensure the numpy array has positive strides
+        color = np.ascontiguousarray(color)
+
+        # Convert the rendered image to a tensor
+        view = torch.tensor(color, dtype=torch.float32).permute(2, 0, 1) / 255.0
+        return view
 
 def load_data(partition_id: int, num_partitions: int):
     """Load partition data from the specified data directory."""
@@ -70,7 +93,6 @@ def load_data(partition_id: int, num_partitions: int):
 
     return trainloader, testloader
 
-
 def train_feature_extractor(net, trainloader, epochs, device, modality_idx):
     """Train the feature extractor on the training set."""
     net.to(device)  # move model to GPU if available
@@ -81,16 +103,15 @@ def train_feature_extractor(net, trainloader, epochs, device, modality_idx):
     for _ in range(epochs):
         for batch in trainloader:
             modality = batch[modality_idx]
-            labels = batch[2]
+            labels = torch.tensor(batch[2], dtype=torch.long).to(device)
             optimizer.zero_grad()
-            loss = criterion(net(modality.to(device)), labels.to(device))
+            loss = criterion(net(modality.to(device)), labels)
             loss.backward()
             optimizer.step()
             running_loss += loss.item()
 
     avg_trainloss = running_loss / len(trainloader)
     return avg_trainloss
-
 
 def train_classifier(net, trainloader, epochs, device):
     """Train the classifier on the combined features from both modalities."""
@@ -101,17 +122,17 @@ def train_classifier(net, trainloader, epochs, device):
     running_loss = 0.0
     for _ in range(epochs):
         for batch in trainloader:
-            modality1, modality2, labels = batch
+            modality1, modality2 = batch[0], batch[1]
+            labels = torch.tensor(batch[2], dtype=torch.long).to(device)
             optimizer.zero_grad()
             outputs = net(modality1.to(device), modality2.to(device))
-            loss = criterion(outputs, labels.to(device))
+            loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
             running_loss += loss.item()
 
     avg_trainloss = running_loss / len(trainloader)
     return avg_trainloss
-
 
 def train(net, trainloader, epochs, device):
     """Train the model on the training set."""
@@ -125,7 +146,6 @@ def train(net, trainloader, epochs, device):
     avg_trainloss = train_classifier(classifier, trainloader, epochs, device)
     return avg_trainloss
 
-
 def test(net, testloader, device):
     """Validate the model on the test set."""
     net.to(device)
@@ -133,18 +153,17 @@ def test(net, testloader, device):
     correct, loss = 0, 0.0
     with torch.no_grad():
         for batch in testloader:
-            modality1, modality2, labels = batch
+            modality1, modality2 = batch[0], batch[1]
+            labels = torch.tensor(batch[2], dtype=torch.long).to(device)
             outputs = net(modality1.to(device), modality2.to(device))
-            loss += criterion(outputs, labels.to(device)).item()
+            loss += criterion(outputs, labels).item()
             correct += (torch.max(outputs.data, 1)[1] == labels).sum().item()
     accuracy = correct / len(testloader.dataset)
     loss = loss / len(testloader)
     return loss, accuracy
 
-
 def get_weights(net):
     return [val.cpu().numpy() for _, val in net.state_dict().items()]
-
 
 def set_weights(net, parameters):
     params_dict = zip(net.state_dict().keys(), parameters)
