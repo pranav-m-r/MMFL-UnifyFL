@@ -4,7 +4,8 @@ import torch
 
 from flwr.client import ClientApp, NumPyClient
 from flwr.common import Context
-from mmfl.task import Net, get_weights, load_data, set_weights, test, train
+from mmfl.task import get_weights, load_data, set_weights, test, train
+from mmfl.feature_extractor import CombinedModel
 
 
 # Define Flower Client and client_fn
@@ -39,7 +40,7 @@ class FlowerClient(NumPyClient):
 
 def client_fn(context: Context):
     # Load model and data
-    net = Net()
+    net = CombinedModel()
     partition_id = context.node_config["partition-id"]
     num_partitions = context.node_config["num-partitions"]
     trainloader, valloader = load_data(partition_id, num_partitions)
