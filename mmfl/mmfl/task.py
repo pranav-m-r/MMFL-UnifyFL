@@ -9,15 +9,18 @@ import trimesh
 import pyrender
 from typing import OrderedDict
 
+os.environ["PYOPENGL_PLATFORM"] = "egl"
+
 # Read the metadata file and create a global dictionary of classes
-metadata_file = '..\\metadata_modelnet40.csv'
+metadata_file = '../metadata_modelnet40.csv'
 metadata = pd.read_csv(metadata_file)
 class_names = metadata['class'].unique()
 class_to_idx = {class_name: idx for idx, class_name in enumerate(class_names)}
 
 class CustomDataset(Dataset):
-    def __init__(self, data_dir, transform=None, image_size=(224, 224)):
+    def __init__(self, data_dir, tensor_dir, transform=None, image_size=(224, 224)):
         self.data_dir = data_dir
+        self.tensor_dir = tensor_dir
         self.transform = transform
         self.image_size = image_size
         self.data = []
@@ -31,9 +34,14 @@ class CustomDataset(Dataset):
 
     def __getitem__(self, idx):
         file_path, class_name = self.data[idx]
-        print(f"Loading file: {file_path}")  # Debug print
-        data = read_off(file_path)
-        modality1, modality2 = self.generate_views(data)
+        tensor_file = os.path.join(self.tensor_dir, f"{os.path.basename(file_path)}.pt")
+        if os.path.exists(tensor_file):
+            modality1, modality2 = torch.load(tensor_file)
+        else:
+            print(f"Rendering and saving file: {file_path}")  # Debug print
+            data = read_off(file_path)
+            modality1, modality2 = self.generate_views(data)
+            torch.save((modality1, modality2), tensor_file)
         label = class_to_idx[class_name]
         # if self.transform:
         #     modality1 = self.transform(modality1)
@@ -77,7 +85,9 @@ class CustomDataset(Dataset):
 
 def load_data(partition_id: int, num_partitions: int):
     """Load partition data from the specified data directory."""
-    data_dir = f'..\\data\\client{partition_id+1}'
+    data_dir = f'../data/client{partition_id+1}'
+    tensor_dir = f'../data/client{partition_id+1}/tensors'
+    os.makedirs(tensor_dir, exist_ok=True)
     train_dir = os.path.join(data_dir, 'train')
     test_dir = os.path.join(data_dir, 'test')
 
@@ -85,8 +95,8 @@ def load_data(partition_id: int, num_partitions: int):
         [ToTensor(), Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]
     )
 
-    train_dataset = CustomDataset(train_dir, transform=pytorch_transforms)
-    test_dataset = CustomDataset(test_dir, transform=pytorch_transforms)
+    train_dataset = CustomDataset(train_dir, tensor_dir, transform=pytorch_transforms)
+    test_dataset = CustomDataset(test_dir, tensor_dir, transform=pytorch_transforms)
 
     trainloader = DataLoader(train_dataset, batch_size=32, shuffle=True)
     testloader = DataLoader(test_dataset, batch_size=32)

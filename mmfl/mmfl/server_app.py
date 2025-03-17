@@ -4,7 +4,7 @@ from flwr.common import Context, ndarrays_to_parameters
 from flwr.server import ServerApp, ServerAppComponents, ServerConfig
 from flwr.server.strategy import FedAvg
 from mmfl.task import get_weights
-from mmfl.feature_extractor import CombinedModel
+from mmfl.models import CombinedModel
 from typing import List, Tuple, Optional, Dict
 import numpy as np
 

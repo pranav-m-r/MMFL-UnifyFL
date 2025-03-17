@@ -5,7 +5,7 @@ import torch
 from flwr.client import ClientApp, NumPyClient
 from flwr.common import Context
 from mmfl.task import get_weights, load_data, set_weights, test, train
-from mmfl.feature_extractor import CombinedModel
+from mmfl.models import CombinedModel
 
 
 # Define Flower Client and client_fn
