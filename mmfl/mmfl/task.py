@@ -17,6 +17,7 @@ metadata = pd.read_csv(metadata_file)
 class_names = metadata['class'].unique()
 class_to_idx = {class_name: idx for idx, class_name in enumerate(class_names)}
 
+
 class CustomDataset(Dataset):
     def __init__(self, data_dir, tensor_dir, transform=None, image_size=(224, 224)):
         self.data_dir = data_dir
@@ -104,18 +105,18 @@ def load_data(partition_id: int, num_partitions: int):
     return trainloader, testloader
 
 def train_feature_extractor(net, trainloader, epochs, device, modality_idx):
-    """Train the feature extractor on the training set."""
+    """Train the feature extractor on the training set using reconstruction loss."""
     net.to(device)  # move model to GPU if available
-    criterion = torch.nn.CrossEntropyLoss().to(device)
+    criterion = torch.nn.MSELoss().to(device)
     optimizer = torch.optim.Adam(net.parameters(), lr=0.01)
     net.train()
     running_loss = 0.0
     for _ in range(epochs):
         for batch in trainloader:
-            modality = batch[modality_idx]
-            labels = torch.tensor(batch[2], dtype=torch.long).to(device)
+            modality = batch[modality_idx].to(device)
             optimizer.zero_grad()
-            loss = criterion(net(modality.to(device)), labels)
+            _, reconstruction = net(modality)
+            loss = criterion(reconstruction, modality)
             loss.backward()
             optimizer.step()
             running_loss += loss.item()
@@ -135,7 +136,10 @@ def train_classifier(net, trainloader, epochs, device):
             modality1, modality2 = batch[0], batch[1]
             labels = torch.tensor(batch[2], dtype=torch.long).to(device)
             optimizer.zero_grad()
-            outputs = net(modality1.to(device), modality2.to(device))
+            features1, _ = net.feature_extractor1(modality1.to(device))
+            features2, _ = net.feature_extractor2(modality2.to(device))
+            fused_features = net.attention_fusion(features1, features2)
+            outputs = net.classifier(fused_features)
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
@@ -146,14 +150,14 @@ def train_classifier(net, trainloader, epochs, device):
 
 def train(net, trainloader, epochs, device):
     """Train the model on the training set."""
-    feature_extractor1, feature_extractor2, classifier = net.feature_extractor1, net.feature_extractor2, net.classifier
+    net.to(device)  # move model to GPU if available
 
     # Train feature extractors
-    train_feature_extractor(feature_extractor1, trainloader, epochs, device, modality_idx=0)
-    train_feature_extractor(feature_extractor2, trainloader, epochs, device, modality_idx=1)
+    train_feature_extractor(net.feature_extractor1, trainloader, epochs, device, modality_idx=0)
+    train_feature_extractor(net.feature_extractor2, trainloader, epochs, device, modality_idx=1)
 
-    # Train classifier
-    avg_trainloss = train_classifier(classifier, trainloader, epochs, device)
+    # Train classifier and attention layer
+    avg_trainloss = train_classifier(net, trainloader, epochs, device)
     return avg_trainloss
 
 def test(net, testloader, device):
