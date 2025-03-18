@@ -2,33 +2,39 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class FeatureExtractor(nn.Module):
-    def __init__(self):
-        super(FeatureExtractor, self).__init__()
-        self.conv1 = nn.Conv2d(3, 6, kernel_size=5, stride=1, padding=0)
-        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.conv2 = nn.Conv2d(6, 16, kernel_size=5, stride=1, padding=0)
-        self.fc1 = nn.Linear(16 * 53 * 53, 120)  # Dynamically calculated later
+class CNNLayers(nn.Module):
+    def __init__(self, input_size):
+        super(CNNLayers, self).__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(input_size, 8, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(8),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Dropout(),
+
+            nn.Conv2d(8, 32, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Dropout(),
+        )
 
         # Decoder for reconstruction
-        self.fc2 = nn.Linear(120, 16 * 53 * 53)
-        self.deconv1 = nn.ConvTranspose2d(16, 6, kernel_size=5, stride=2, padding=0)
-        self.deconv2 = nn.ConvTranspose2d(6, 3, kernel_size=5, stride=2, padding=0)
-        self.deconv3 = nn.ConvTranspose2d(3, 3, kernel_size=4, stride=2, padding=1)
+        self.fc1 = nn.Linear(32 * 28 * 28, 32 * 28 * 28)
+        self.deconv1 = nn.ConvTranspose2d(32, 16, kernel_size=3, stride=2, padding=1, output_padding=1)
+        self.deconv2 = nn.ConvTranspose2d(16, input_size, kernel_size=3, stride=2, padding=1, output_padding=1)
 
     def forward(self, x):
-        x = self.pool(F.relu(self.conv1(x)))  # Output: (B, 6, 110, 110)
-        x = self.pool(F.relu(self.conv2(x)))  # Output: (B, 16, 53, 53)
-        x = x.view(x.size(0), -1)  # Flatten dynamically
-        features = F.relu(self.fc1(x))
+        x = self.features(x)
+        x = x.view(x.size(0), -1)
+        return x
 
-        # Reconstruction
-        x = F.relu(self.fc2(features))
-        x = x.view(-1, 16, 53, 53)
-        x = F.relu(self.deconv1(x))  # Output: (B, 6, 109, 109)
-        x = F.relu(self.deconv2(x))  # Output: (B, 3, 221, 221)
-        reconstruction = torch.sigmoid(self.deconv3(x))  # Output: (B, 3, 224, 224)
-        return features, reconstruction
+    def reconstruct(self, features):
+        x = F.relu(self.fc1(features))
+        x = x.view(-1, 32, 28, 28)
+        x = F.relu(self.deconv1(x))
+        reconstruction = torch.sigmoid(self.deconv2(x))
+        return reconstruction
 
 class AttentionFusionLayer(nn.Module):
     def __init__(self, input_dim):
@@ -37,7 +43,7 @@ class AttentionFusionLayer(nn.Module):
         self.fc2 = nn.Linear(input_dim, 2)  # Two weights, one for each modality
 
     def forward(self, x1, x2):
-        combined = torch.cat((x1, x2), dim=1)  # Shape: (B, 240)
+        combined = torch.cat((x1, x2), dim=1)  # Shape: (B, 32 * 28 * 28 * 2)
         attention_scores = self.fc2(F.relu(self.fc1(combined)))  # Shape: (B, 2)
         attention_weights = F.softmax(attention_scores, dim=1)  # Sum to 1
 
@@ -49,26 +55,26 @@ class AttentionFusionLayer(nn.Module):
         return fused_features
 
 class Classifier(nn.Module):
-    def __init__(self):
+    def __init__(self, input_dim, num_classes):
         super(Classifier, self).__init__()
-        self.fc1 = nn.Linear(120, 64)
-        self.fc2 = nn.Linear(64, 40)  # ModelNet40 has 40 classes
+        self.fc1 = nn.Linear(input_dim, 64)
+        self.fc2 = nn.Linear(64, num_classes)
 
     def forward(self, x):
         x = F.relu(self.fc1(x))
         return self.fc2(x)
 
 class CombinedModel(nn.Module):
-    def __init__(self):
+    def __init__(self, input_size=3, num_classes=40):  # Default values for input_size and num_classes
         super(CombinedModel, self).__init__()
-        self.feature_extractor1 = FeatureExtractor()
-        self.feature_extractor2 = FeatureExtractor()
-        self.attention_fusion = AttentionFusionLayer(input_dim=120)
-        self.classifier = Classifier()
+        self.cnn_layers1 = CNNLayers(input_size)
+        self.cnn_layers2 = CNNLayers(input_size)
+        self.attention_fusion = AttentionFusionLayer(input_dim=32 * 28 * 28)
+        self.classifier = Classifier(32 * 28 * 28, num_classes)
 
     def forward(self, x1, x2):
-        features1, _ = self.feature_extractor1(x1)
-        features2, _ = self.feature_extractor2(x2)
+        features1 = self.cnn_layers1(x1)
+        features2 = self.cnn_layers2(x2)
         fused_features = self.attention_fusion(features1, features2)
         output = self.classifier(fused_features)
         return output

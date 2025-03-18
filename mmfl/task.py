@@ -1,13 +1,13 @@
-import pandas as pd
 from torch.utils.data import DataLoader, Dataset
 from torchvision.transforms import Compose, Normalize, ToTensor
 from torch_geometric.io import read_off
-import torch
+from typing import OrderedDict
 import os
-import numpy as np
+import pandas as pd
+import torch
 import trimesh
 import pyrender
-from typing import OrderedDict
+import numpy as np
 
 os.environ["PYOPENGL_PLATFORM"] = "egl"
 
@@ -16,7 +16,6 @@ metadata_file = '../metadata_modelnet40.csv'
 metadata = pd.read_csv(metadata_file)
 class_names = metadata['class'].unique()
 class_to_idx = {class_name: idx for idx, class_name in enumerate(class_names)}
-
 
 class CustomDataset(Dataset):
     def __init__(self, data_dir, tensor_dir, transform=None, image_size=(224, 224)):
@@ -44,9 +43,6 @@ class CustomDataset(Dataset):
             modality1, modality2 = self.generate_views(data)
             torch.save((modality1, modality2), tensor_file)
         label = class_to_idx[class_name]
-        # if self.transform:
-        #     modality1 = self.transform(modality1)
-        #     modality2 = self.transform(modality2)
         return modality1, modality2, label
 
     def generate_views(self, data):
@@ -100,51 +96,61 @@ def load_data(partition_id: int, num_partitions: int):
     test_dataset = CustomDataset(test_dir, tensor_dir, transform=pytorch_transforms)
 
     # Reduce batch size to lower memory consumption
-    trainloader = DataLoader(train_dataset, batch_size=8, shuffle=True)
-    testloader = DataLoader(test_dataset, batch_size=8)
+    trainloader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+    testloader = DataLoader(test_dataset, batch_size=32)
 
     return trainloader, testloader
 
 def train_feature_extractor(net, trainloader, epochs, device, modality_idx):
     """Train the feature extractor on the training set using reconstruction loss."""
+    print(f"Training the feature extractor for modality {modality_idx}")
     net.to(device)  # move model to GPU if available
     criterion = torch.nn.MSELoss().to(device)
     optimizer = torch.optim.Adam(net.parameters(), lr=0.01)
     net.train()
     running_loss = 0.0
+    count = 0
     for _ in range(epochs):
         for batch in trainloader:
+            count += 1
             modality = batch[modality_idx].to(device)
             optimizer.zero_grad()
-            features = net(modality)
-            reconstruction = net.reconstruct(features)
+            features = net.encoder(modality)
+            reconstruction = net.decoder(features)
             loss = criterion(reconstruction, modality)
             loss.backward()
             optimizer.step()
             running_loss += loss.item()
-
-    avg_trainloss = running_loss / len(trainloader)
+        print(f"Epoch {_} Training loss: {running_loss / count}")
+    avg_trainloss = running_loss / count
+    print(f"Average training loss: {avg_trainloss}")
     return avg_trainloss
 
 def train_classifier(net, trainloader, epochs, device):
     """Train the classifier on the combined features from both modalities."""
+    print("Training the classifier")
     net.to(device)  # move model to GPU if available
     criterion = torch.nn.CrossEntropyLoss().to(device)
     optimizer = torch.optim.Adam(net.parameters(), lr=0.01)
     net.train()
     running_loss = 0.0
+    count = 0
     for _ in range(epochs):
         for batch in trainloader:
-            modality1, modality2 = batch[0], batch[1]
-            labels = torch.tensor(batch[2], dtype=torch.long).to(device)
+            count += 1
+            modality1, modality2, labels = batch
+            modality1, modality2, labels = modality1.to(device), modality2.to(device), labels.to(device)
             optimizer.zero_grad()
-            outputs = net(modality1.to(device), modality2.to(device))
-            loss = criterion(outputs, labels)
+            output = net(modality1, modality2)
+            # print("output: ", output.shape)
+            # print("labels: ", labels.shape)
+            loss = criterion(output, labels)
             loss.backward()
             optimizer.step()
             running_loss += loss.item()
+        print(f"Epoch {_} Training loss: {running_loss / count}")
 
-    avg_trainloss = running_loss / len(trainloader)
+    avg_trainloss = running_loss / count
     return avg_trainloss
 
 def train(net, trainloader, epochs, device):
@@ -155,24 +161,36 @@ def train(net, trainloader, epochs, device):
     train_feature_extractor(net.cnn_layers1, trainloader, epochs, device, modality_idx=0)
     train_feature_extractor(net.cnn_layers2, trainloader, epochs, device, modality_idx=1)
 
+    # Freeze the feature extractors
+    for param in net.cnn_layers1.parameters():
+        param.requires_grad = False
+    for param in net.cnn_layers2.parameters():
+        param.requires_grad = False
+
     # Train classifier and attention layer
     avg_trainloss = train_classifier(net, trainloader, epochs, device)
     return avg_trainloss
 
 def test(net, testloader, device):
     """Validate the model on the test set."""
+    print("Testing the model")
     net.to(device)
     criterion = torch.nn.CrossEntropyLoss()
     correct, loss = 0, 0.0
+    count = 0
     with torch.no_grad():
         for batch in testloader:
-            modality1, modality2 = batch[0], batch[1]
-            labels = torch.tensor(batch[2], dtype=torch.long).to(device)
-            outputs = net(modality1.to(device), modality2.to(device))
-            loss += criterion(outputs, labels).item()
-            correct += (torch.max(outputs.data, 1)[1] == labels).sum().item()
+            count += len(batch)
+            modality1, modality2, labels = batch
+            modality1, modality2, labels = modality1.to(device), modality2.to(device), labels.to(device)
+            output = net(modality1, modality2)
+            loss += criterion(output, labels).item()
+            pred = output.argmax(dim=1, keepdim=True)
+            correct += pred.eq(labels.view_as(pred)).sum().item()
+
     accuracy = correct / len(testloader.dataset)
     loss = loss / len(testloader)
+
     return loss, accuracy
 
 def get_weights(net):
