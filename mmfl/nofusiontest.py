@@ -1,10 +1,12 @@
-from torch.utils.data import DataLoader, Dataset
-from torchvision.transforms import Compose, Normalize, ToTensor
-from torch_geometric.io import read_off
-from typing import OrderedDict
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import List
 import os
 import pandas as pd
-import torch
+from torch.utils.data import Dataset, DataLoader
+from torchvision.transforms import Compose, Normalize, ToTensor
+from torch_geometric.io import read_off
 import trimesh
 import pyrender
 import numpy as np
@@ -16,6 +18,137 @@ metadata_file = '../metadata_modelnet40.csv'
 metadata = pd.read_csv(metadata_file)
 class_names = metadata['class'].unique()
 class_to_idx = {class_name: idx for idx, class_name in enumerate(class_names)}
+
+class CNNAutoencoder(nn.Module):
+    """A CNN autoencoder.
+
+    Stacks n layers of (Conv2d, MaxPool2d, BatchNorm2d) for the encoder and
+    (ConvTranspose2d, BatchNorm2d) for the decoder, where n is determined
+    by the length of the input args.
+
+    Args:
+        input_dims (List[int]): List of input dimensions.
+        output_dims (List[int]): List of output dimensions. Should match
+            input_dims offset by one.
+        kernel_sizes (List[int]): Kernel sizes for convolutions. Should match
+            the sizes of cnn_input_dims and cnn_output_dims.
+
+    Inputs:
+        x (Tensor): Tensor containing a batch of images.
+    """
+
+    def __init__(
+        self, input_dims: List[int], output_dims: List[int], kernel_sizes: List[int]
+    ):
+        super().__init__()
+        assert len(input_dims) == len(output_dims) and len(output_dims) == len(
+            kernel_sizes
+        ), "input_dims, output_dims, and kernel_sizes should all have the same length"
+        assert (
+            input_dims[1:] == output_dims[:-1]
+        ), "output_dims should match input_dims offset by one"
+
+        # Encoder
+        encoder_layers: List[nn.Module] = []
+        for in_channels, out_channels, kernel_size in zip(
+            input_dims,
+            output_dims,
+            kernel_sizes,
+        ):
+            padding_size = kernel_size // 2
+
+            conv = nn.Conv2d(
+                in_channels, out_channels, kernel_size, padding=padding_size
+            )
+
+            max_pool2d = nn.MaxPool2d(2, stride=2)
+            batch_norm_2d = nn.BatchNorm2d(out_channels)
+
+            encoder_layers.append(
+                nn.Sequential(conv, nn.LeakyReLU(), max_pool2d, batch_norm_2d)
+            )
+
+        self.encoder = nn.Sequential(*encoder_layers)
+
+        # Decoder
+        decoder_layers: List[nn.Module] = []
+        for in_channels, out_channels, kernel_size in zip(
+            reversed(output_dims),
+            reversed(input_dims),
+            reversed(kernel_sizes),
+        ):
+            padding_size = kernel_size // 2
+
+            deconv = nn.ConvTranspose2d(
+                in_channels, out_channels, kernel_size, stride=2, padding=padding_size, output_padding=1
+            )
+
+            batch_norm_2d = nn.BatchNorm2d(out_channels)
+
+            decoder_layers.append(
+                nn.Sequential(deconv, nn.LeakyReLU(), batch_norm_2d)
+            )
+
+        self.decoder = nn.Sequential(*decoder_layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        encoded = self.encoder(x)
+        decoded = self.decoder(encoded)
+        return decoded
+
+# class AttentionFusionLayer(nn.Module):
+#     def __init__(self, input_dim):
+#         super(AttentionFusionLayer, self).__init__()
+#         self.fc1 = nn.Linear(input_dim * 2, input_dim)
+#         self.fc2 = nn.Linear(input_dim, 2)  # Two weights, one for each modality
+
+#     def forward(self, x1, x2):
+#         # Combine the two modalities
+#         combined = torch.cat((x1, x2), dim=1)  # Shape: (B, 128, 14, 14)
+        
+#         # Apply attention mechanism
+#         attention_scores = self.fc2(F.relu(self.fc1(combined.mean(dim=[2, 3]))))  # Reduce spatial dimensions
+#         attention_weights = F.softmax(attention_scores, dim=1)  # Shape: (B, 2)
+
+#         # Apply attention weights to both modalities
+#         fused_features = (
+#             attention_weights[:, 0].unsqueeze(1).unsqueeze(2).unsqueeze(3) * x1
+#             + attention_weights[:, 1].unsqueeze(1).unsqueeze(2).unsqueeze(3) * x2
+#         )  # Shape: (B, 64, 14, 14)
+
+#         # Flatten the spatial dimensions
+#         fused_features = fused_features.view(fused_features.size(0), -1)  # Shape: (B, 64 * 14 * 14)
+#         return fused_features
+
+class Classifier(nn.Module):
+    def __init__(self, input_dim, num_classes):
+        super(Classifier, self).__init__()
+        self.fc1 = nn.Linear(input_dim, 64)
+        self.fc2 = nn.Linear(64, 128)
+        self.fc3 = nn.Linear(128, 256)
+        self.fc4 = nn.Linear(256, num_classes)
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = F.relu(self.fc3(x))
+        return self.fc4(x)
+
+class CombinedModel(nn.Module):
+    def __init__(self, input_dims, output_dims, kernel_sizes, num_classes):  # Default values for input_size and num_classes
+        super(CombinedModel, self).__init__()
+        self.cnn_layers1 = CNNAutoencoder(input_dims, output_dims, kernel_sizes)
+        # self.cnn_layers2 = CNNAutoencoder(input_dims, output_dims, kernel_sizes)
+        # self.attention_fusion = AttentionFusionLayer(input_dim=output_dims[-1])
+        self.classifier = Classifier(14 * 14 * 64, num_classes)
+
+    def forward(self, x1, x2):
+        features1 = self.cnn_layers1.encoder(x1)
+        features1 = features1.view(features1.size(0), -1)
+        # features2 = self.cnn_layers2.encoder(x2)
+        # fused_features = self.attention_fusion(features1, features2)
+        output = self.classifier(features1)
+        return output
 
 class CustomDataset(Dataset):
     def __init__(self, data_dir, tensor_dir, transform=None, image_size=(224, 224)):
@@ -159,16 +292,16 @@ def train(net, trainloader, epochs, device):
 
     # Train feature extractors
     train_feature_extractor(net.cnn_layers1, trainloader, epochs, device, modality_idx=0)
-    train_feature_extractor(net.cnn_layers2, trainloader, epochs, device, modality_idx=1)
+    # train_feature_extractor(net.cnn_layers1, trainloader, epochs, device, modality_idx=1)
 
     # Freeze the feature extractors
     for param in net.cnn_layers1.parameters():
         param.requires_grad = False
-    for param in net.cnn_layers2.parameters():
-        param.requires_grad = False
+    # for param in net.cnn_layers2.parameters():
+    #     param.requires_grad = False
 
     # Train classifier and attention layer
-    avg_trainloss = train_classifier(net, trainloader, 3 * epochs, device)
+    avg_trainloss = train_classifier(net, trainloader, 2 * epochs, device)
     return avg_trainloss
 
 def test(net, testloader, device):
@@ -193,10 +326,24 @@ def test(net, testloader, device):
 
     return loss, accuracy
 
-def get_weights(net):
-    return [val.cpu().numpy() for _, val in net.state_dict().items()]
+# Set device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def set_weights(net, parameters):
-    params_dict = zip(net.state_dict().keys(), parameters)
-    state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
-    net.load_state_dict(state_dict, strict=True)
+# Load data
+trainloader, testloader = load_data(partition_id=0, num_partitions=1)
+
+# Initialize model
+input_dims = [3, 8, 16, 32]  # Example input dimensions
+output_dims = [8, 16, 32, 64]  # Example output dimensions
+kernel_sizes = [3, 3, 3, 3]  # Example kernel sizes
+num_classes = 40  # Number of classes in ModelNet40
+model = CombinedModel(input_dims=input_dims, output_dims=output_dims, kernel_sizes=kernel_sizes, num_classes=num_classes)
+
+# Train model
+epochs = 10
+avg_trainloss = train(model, trainloader, epochs, device)
+print(f"Average training loss: {avg_trainloss}")
+
+# Test model
+test_loss, test_accuracy = test(model, testloader, device)
+print(f"Test loss: {test_loss}, Test accuracy: {test_accuracy}")

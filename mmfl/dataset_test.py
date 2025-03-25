@@ -1,10 +1,12 @@
-from torch.utils.data import DataLoader, Dataset
-from torchvision.transforms import Compose, Normalize, ToTensor
-from torch_geometric.io import read_off
-from typing import OrderedDict
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import List
 import os
 import pandas as pd
-import torch
+from torch.utils.data import Dataset, DataLoader
+from torchvision.transforms import Compose, Normalize, ToTensor
+from torch_geometric.io import read_off
 import trimesh
 import pyrender
 import numpy as np
@@ -16,6 +18,20 @@ metadata_file = '../metadata_modelnet40.csv'
 metadata = pd.read_csv(metadata_file)
 class_names = metadata['class'].unique()
 class_to_idx = {class_name: idx for idx, class_name in enumerate(class_names)}
+
+class Classifier(nn.Module):
+    def __init__(self, input_dim, num_classes):
+        super(Classifier, self).__init__()
+        self.fc1 = nn.Linear(input_dim, 128)
+        self.fc2 = nn.Linear(128, 512)
+        self.fc3 = nn.Linear(512, 256)
+        self.fc4 = nn.Linear(256, num_classes)
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = F.relu(self.fc3(x))
+        return self.fc4(x)
 
 class CustomDataset(Dataset):
     def __init__(self, data_dir, tensor_dir, transform=None, image_size=(224, 224)):
@@ -101,31 +117,6 @@ def load_data(partition_id: int, num_partitions: int):
 
     return trainloader, testloader
 
-def train_feature_extractor(net, trainloader, epochs, device, modality_idx):
-    """Train the feature extractor on the training set using reconstruction loss."""
-    print(f"Training the feature extractor for modality {modality_idx}")
-    net.to(device)  # move model to GPU if available
-    criterion = torch.nn.MSELoss().to(device)
-    optimizer = torch.optim.Adam(net.parameters(), lr=0.01)
-    net.train()
-    running_loss = 0.0
-    count = 0
-    for _ in range(epochs):
-        for batch in trainloader:
-            count += 1
-            modality = batch[modality_idx].to(device)
-            optimizer.zero_grad()
-            features = net.encoder(modality)
-            reconstruction = net.decoder(features)
-            loss = criterion(reconstruction, modality)
-            loss.backward()
-            optimizer.step()
-            running_loss += loss.item()
-        print(f"Epoch {_} Training loss: {running_loss / count}")
-    avg_trainloss = running_loss / count
-    print(f"Average training loss: {avg_trainloss}")
-    return avg_trainloss
-
 def train_classifier(net, trainloader, epochs, device):
     """Train the classifier on the combined features from both modalities."""
     print("Training the classifier")
@@ -141,9 +132,8 @@ def train_classifier(net, trainloader, epochs, device):
             modality1, modality2, labels = batch
             modality1, modality2, labels = modality1.to(device), modality2.to(device), labels.to(device)
             optimizer.zero_grad()
-            output = net(modality1, modality2)
-            # print("output: ", output.shape)
-            # print("labels: ", labels.shape)
+            modality1 = modality1.view(modality1.size(0), -1)
+            output = net(modality1)
             loss = criterion(output, labels)
             loss.backward()
             optimizer.step()
@@ -151,24 +141,6 @@ def train_classifier(net, trainloader, epochs, device):
         print(f"Epoch {_} Training loss: {running_loss / count}")
 
     avg_trainloss = running_loss / count
-    return avg_trainloss
-
-def train(net, trainloader, epochs, device):
-    """Train the model on the training set."""
-    net.to(device)  # move model to GPU if available
-
-    # Train feature extractors
-    train_feature_extractor(net.cnn_layers1, trainloader, epochs, device, modality_idx=0)
-    train_feature_extractor(net.cnn_layers2, trainloader, epochs, device, modality_idx=1)
-
-    # Freeze the feature extractors
-    for param in net.cnn_layers1.parameters():
-        param.requires_grad = False
-    for param in net.cnn_layers2.parameters():
-        param.requires_grad = False
-
-    # Train classifier and attention layer
-    avg_trainloss = train_classifier(net, trainloader, 3 * epochs, device)
     return avg_trainloss
 
 def test(net, testloader, device):
@@ -183,7 +155,8 @@ def test(net, testloader, device):
             count += len(batch)
             modality1, modality2, labels = batch
             modality1, modality2, labels = modality1.to(device), modality2.to(device), labels.to(device)
-            output = net(modality1, modality2)
+            modality1 = modality1.view(modality1.size(0), -1)
+            output = net(modality1)
             loss += criterion(output, labels).item()
             pred = output.argmax(dim=1, keepdim=True)
             correct += pred.eq(labels.view_as(pred)).sum().item()
@@ -193,10 +166,20 @@ def test(net, testloader, device):
 
     return loss, accuracy
 
-def get_weights(net):
-    return [val.cpu().numpy() for _, val in net.state_dict().items()]
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def set_weights(net, parameters):
-    params_dict = zip(net.state_dict().keys(), parameters)
-    state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
-    net.load_state_dict(state_dict, strict=True)
+# Load data
+trainloader, testloader = load_data(partition_id=0, num_partitions=1)
+
+num_classes = 40  # Number of classes in ModelNet40
+input_dims = 150528
+model = Classifier(input_dim=input_dims, num_classes=num_classes)
+
+# Train model
+epochs = 50
+avg_trainloss = train_classifier(model, trainloader, epochs, device)
+print(f"Average training loss: {avg_trainloss}")
+
+# Test model
+test_loss, test_accuracy = test(model, testloader, device)
+print(f"Test loss: {test_loss}, Test accuracy: {test_accuracy}")
